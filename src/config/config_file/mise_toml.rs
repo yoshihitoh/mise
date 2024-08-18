@@ -14,7 +14,7 @@ use toml_edit::{table, value, Array, DocumentMut, Item, Value};
 use versions::Versioning;
 
 use crate::cli::args::{BackendArg, ToolVersionType};
-use crate::config::config_file::toml::deserialize_arr;
+use crate::config::config_file::toml::{deserialize_arr, TomlParser};
 use crate::config::config_file::{trust_check, ConfigFile, TaskConfig};
 use crate::config::env_directive::EnvDirective;
 use crate::config::settings::SettingsPartial;
@@ -85,13 +85,43 @@ impl MiseToml {
     pub fn from_file(path: &Path) -> eyre::Result<Self> {
         trace!("parsing: {}", display_path(path));
         let body = file::read_to_string(path)?;
-        let mut rf: MiseToml = toml::from_str(&body)?;
+
+        let mut values: toml::Value = toml::from_str(&body)?;
+        let tasks = values.as_table_mut().and_then(|t| t.remove("tasks"));
+        let body_without_tasks = toml::to_string(&values)?;
+        let mut rf: MiseToml = toml::from_str(&body_without_tasks)?;
         rf.context = BASE_CONTEXT.clone();
         rf.context
             .insert("config_root", path.parent().unwrap().to_str().unwrap());
         rf.path = path.to_path_buf();
-        for task in rf.tasks.0.values_mut() {
-            task.config_source.clone_from(&rf.path);
+
+        let dir = rf.path.parent();
+        for &task_toml in tasks.as_ref().and_then(|v| v.as_table()).iter() {
+            if let Some((name, info)) = task_toml.iter().next() {
+                let p = TomlParser::new(info, get_tera(dir), rf.context.clone());
+
+                let task = Task {
+                    name: name.to_owned(),
+                    hide: p.parse_bool("hide").unwrap_or_default(),
+                    aliases: p
+                        .parse_array("alias")?
+                        .unwrap_or(vec![p.parse_str("alias")?.unwrap_or_default()]),
+                    description: p.parse_str("description")?.unwrap_or_default(),
+                    sources: p.parse_array("sources")?.unwrap_or_default(),
+                    outputs: p.parse_array("outputs")?.unwrap_or_default(),
+                    depends: p.parse_array("depends")?.unwrap_or_default(),
+                    dir: p.parse_str("dir")?,
+                    env: p.parse_env("env")?.unwrap_or_default(),
+                    file: p.parse_str("file")?,
+                    config_source: path.to_path_buf(),
+                    run: p.parse_array("run")?.map(Ok).unwrap_or_else(|| {
+                        p.parse_str::<String>("run")
+                            .map(|r| r.map(|s| vec![s]).unwrap_or_default())
+                    })?,
+                    ..Default::default()
+                };
+                rf.tasks.0.entry(name.to_owned()).or_insert(task);
+            }
         }
         trace!("{}", rf.dump()?);
         Ok(rf)
